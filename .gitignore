@@ -1,0 +1,18 @@
+# Build output
+dsscan
+
+# Scan output
+*.pdf
+*.tiff
+*.jpg
+*.png
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Claude Code
+.claude/
