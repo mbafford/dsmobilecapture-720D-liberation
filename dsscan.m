@@ -12,6 +12,7 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <signal.h>
+#include <fcntl.h>
 #import <objc/runtime.h>
 
 // ============================================================================
@@ -75,17 +76,22 @@ static int gTwainState = 1; // 1=pre, 2=DSM open, 3=DS open, 4=enabled, 5+=trans
 static BOOL gTransferReady = NO;
 static BOOL gScanDone = NO;
 static NSMutableArray *gScannedImages = nil; // Array of NSImage/file paths
+static BOOL gDebug = NO;
+static int gRealStderrFd = STDERR_FILENO; // fd for real terminal (after redirect)
 
 // ============================================================================
-// DS-720D Driver Crash Workaround
+// DS-720D Driver UI Swizzles
 // ============================================================================
-// The DS-720D TWAIN driver has a bug: after scanning completes, its background
-// thread ([DS720DDS nextJob]) calls [DialogBoxController closeTransportWindow],
-// which tries to close/animate an NSWindow off the main thread, causing SIGABRT.
+// The DS-720D TWAIN driver shows GUI popups during scanning:
+//   - Progress window ("Image N transferring", elapsed time, progress bar)
+//   - Paper-wait window ("Insert paper to the feeder", countdown timer)
+//   - Alert dialogs for errors (paper jam, no paper, etc.)
 //
-// Fix: method-swizzle closeTransportWindow to be a no-op. This is safe because
-// we _exit() after saving output anyway, so the leaked window doesn't matter.
-// We also install SIGABRT handler as a belt-and-suspenders backup.
+// We swizzle DialogBoxController and DS720DDS methods to:
+// 1. Hide windows offscreen so driver logic still works but nothing is visible
+// 2. Redirect status text to stderr for terminal output
+// 3. Replace alert dialogs with stderr messages
+// 4. Keep signal/exception handlers as defense-in-depth
 
 static volatile int gScanExitCode = 1; // Set to 0 after output is saved
 
@@ -99,38 +105,225 @@ static void driverCrashSignalHandler(int sig) {
     _exit(gScanExitCode);
 }
 
-// Thread-safe replacement for [DialogBoxController closeTransportWindow]
-// The original crashes because it closes an NSWindow from a background thread.
-// We dispatch to the main thread instead.
-static IMP gOriginalCloseTransportWindow = NULL;
+// Pre-computed pointer to DialogBoxController's "cancelled" ivar.
+// Allows the SIGINT handler to cancel the paper-wait countdown using
+// only async-signal-safe operations (raw memory write).
+static volatile BOOL *gCancelledSlot = NULL;
 
-static void safe_closeTransportWindow(id self, SEL _cmd) {
+static void sigintHandler(int sig) {
+    if (gCancelledSlot) {
+        *gCancelledSlot = YES;
+    }
+    const char msg[] = "\n  Stopping scan (saving scanned pages)...\n";
+    write(gRealStderrFd, msg, sizeof(msg) - 1);
+    // Restore default handler so a second Ctrl+C force-kills
+    signal(sig, SIG_DFL);
+}
+
+// Read an NSWindow* ivar from a driver object (compiled without ARC).
+// Uses raw pointer access to avoid ARC retain/release on the driver's ivars.
+static NSWindow *getIvarWindow(id obj, const char *ivarName) {
+    Ivar ivar = class_getInstanceVariable(object_getClass(obj), ivarName);
+    if (!ivar) return nil;
+    ptrdiff_t offset = ivar_getOffset(ivar);
+    void *ptr = *(void **)((uint8_t *)(__bridge void *)obj + offset);
+    return (__bridge NSWindow *)ptr;
+}
+
+// Make driver windows fully transparent. Alpha 0 persists through orderFront:
+// calls, keeping windows invisible while the driver's modal sessions and
+// countdown logic continue to function normally.
+static void ensureWindowsHidden(id dialogBoxController) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    // Set up cancel slot for Ctrl+C signal handler
+    Ivar cancelIvar = class_getInstanceVariable(
+        object_getClass(dialogBoxController), "cancelled");
+    if (cancelIvar) {
+        ptrdiff_t offset = ivar_getOffset(cancelIvar);
+        gCancelledSlot = (volatile BOOL *)(
+            (uint8_t *)(__bridge void *)dialogBoxController + offset);
+    }
+
+    NSWindow *transport = getIvarWindow(dialogBoxController, "transportWindow");
+    NSWindow *indicator = getIvarWindow(dialogBoxController, "indicatorWindow");
+
     if ([NSThread isMainThread]) {
-        if (gOriginalCloseTransportWindow) {
-            ((void (*)(id, SEL))gOriginalCloseTransportWindow)(self, _cmd);
-        }
+        if (transport) [transport setAlphaValue:0.0];
+        if (indicator) [indicator setAlphaValue:0.0];
     } else {
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (gOriginalCloseTransportWindow) {
-                ((void (*)(id, SEL))gOriginalCloseTransportWindow)(self, _cmd);
-            }
+            if (transport) [transport setAlphaValue:0.0];
+            if (indicator) [indicator setAlphaValue:0.0];
         });
     }
 }
 
-static void installDriverCrashWorkarounds(void) {
-    // Swizzle the crashing method to dispatch to main thread
-    Class cls = NSClassFromString(@"DialogBoxController");
-    if (cls) {
-        SEL sel = NSSelectorFromString(@"closeTransportWindow");
-        Method m = class_getInstanceMethod(cls, sel);
-        if (m) {
-            gOriginalCloseTransportWindow =
-                method_setImplementation(m, (IMP)safe_closeTransportWindow);
+// --- DialogBoxController swizzled methods ---
+//
+// IMPORTANT: Every swizzled method chains to the original implementation.
+// The driver's text-setting methods also manage timers, flags, and the
+// countdown state machine — replacing them with pure fprintf broke the
+// countdown loop. We augment with terminal output but preserve all
+// original behavior.
+
+static IMP gOrigAwakeFromNib = NULL;
+static IMP gOrigStartIndicator = NULL;
+static IMP gOrigTextTransferring = NULL;
+static IMP gOrigTextElapsed = NULL;
+static IMP gOrigTextPutPaper = NULL;
+static IMP gOrigTextTimeRemain = NULL;
+static IMP gOrigCloseTransportWindow = NULL;
+static IMP gOrigShowContinueButton = NULL;
+
+static void swizzled_awakeFromNib(id self, SEL _cmd) {
+    if (gOrigAwakeFromNib) {
+        ((void (*)(id, SEL))gOrigAwakeFromNib)(self, _cmd);
+    }
+    ensureWindowsHidden(self);
+}
+
+static void swizzled_startIndicator(id self, SEL _cmd) {
+    ensureWindowsHidden(self);
+    if (gOrigStartIndicator) {
+        ((void (*)(id, SEL))gOrigStartIndicator)(self, _cmd);
+    }
+}
+
+// Track last transfer text so textElapsed: can rewrite the full line
+static char gLastTransferText[256] = {0};
+
+static void swizzled_textTransferring(id self, SEL _cmd, NSString *text) {
+    ensureWindowsHidden(self);
+    if (gOrigTextTransferring) {
+        ((void (*)(id, SEL, NSString *))gOrigTextTransferring)(self, _cmd, text);
+    }
+    strlcpy(gLastTransferText, [text UTF8String], sizeof(gLastTransferText));
+    fprintf(stderr, "\r  %s\033[K", gLastTransferText);
+    fflush(stderr);
+}
+
+static void swizzled_textElapsed(id self, SEL _cmd, NSString *text) {
+    ensureWindowsHidden(self);
+    if (gOrigTextElapsed) {
+        ((void (*)(id, SEL, NSString *))gOrigTextElapsed)(self, _cmd, text);
+    }
+    fprintf(stderr, "\r  %s (%s)\033[K", gLastTransferText, [text UTF8String]);
+    fflush(stderr);
+}
+
+static void swizzled_textPutPaper(id self, SEL _cmd, NSString *text) {
+    ensureWindowsHidden(self);
+    if (gOrigTextPutPaper) {
+        ((void (*)(id, SEL, NSString *))gOrigTextPutPaper)(self, _cmd, text);
+    }
+    fprintf(stderr, "\n  %s\n", [text UTF8String]);
+}
+
+static void swizzled_textTimeRemain(id self, SEL _cmd, NSString *text) {
+    ensureWindowsHidden(self);
+    if (gOrigTextTimeRemain) {
+        ((void (*)(id, SEL, NSString *))gOrigTextTimeRemain)(self, _cmd, text);
+    }
+    fprintf(stderr, "\r  %s\033[K", [text UTF8String]);
+    fflush(stderr);
+}
+
+// closeTransportWindow: chain to original on the main thread (the original
+// crashes when called from the driver's background thread — this was the
+// original bug that started all the swizzling).
+static void swizzled_closeTransportWindow(id self, SEL _cmd) {
+    fprintf(stderr, "\n");
+    if (gOrigCloseTransportWindow) {
+        if ([NSThread isMainThread]) {
+            ((void (*)(id, SEL))gOrigCloseTransportWindow)(self, _cmd);
+        } else {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ((void (*)(id, SEL))gOrigCloseTransportWindow)(self, _cmd);
+            });
         }
     }
+}
 
-    // Backup: catch SIGABRT in case there are other crash paths
+// When the driver calls showContinueButton:(YES), paper has been detected and
+// it's waiting for the user to click Continue on the (invisible) window.
+// We chain to the original, then auto-continue by setting beContinued and
+// ending the modal session.
+static void swizzled_showContinueButton(id self, SEL _cmd, BOOL show) {
+    if (gOrigShowContinueButton) {
+        ((void (*)(id, SEL, BOOL))gOrigShowContinueButton)(self, _cmd, show);
+    }
+    if (show) {
+        Ivar ivar = class_getInstanceVariable(object_getClass(self), "beContinued");
+        if (ivar) {
+            ptrdiff_t offset = ivar_getOffset(ivar);
+            BOOL *slot = (BOOL *)((uint8_t *)(__bridge void *)self + offset);
+            *slot = YES;
+        }
+        [NSApp stopModal];
+    }
+}
+
+// --- DS720DDS swizzled methods ---
+
+static void swizzled_showAlert(id self, SEL _cmd, NSString *message) {
+    (void)self; (void)_cmd;
+    if (message && [message length] > 0) {
+        fprintf(stderr, "\nScanner alert: %s\n", [message UTF8String]);
+    }
+}
+
+// Helper: replace a method's implementation, return the original IMP
+static IMP swizzleMethod(Class cls, const char *selName, IMP newImp) {
+    SEL sel = sel_registerName(selName);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return NULL;
+    return method_setImplementation(m, newImp);
+}
+
+static void installDriverUISwizzles(void) {
+    // --- DialogBoxController ---
+    // Chain to originals + add terminal output. Methods not listed here
+    // (indicatorValue:, textCancel:, textContinue:, enableCancelButton:)
+    // keep their original implementations — they just update UI controls
+    // on the hidden window and don't need terminal output.
+    Class dbcClass = NSClassFromString(@"DialogBoxController");
+    if (dbcClass) {
+        gOrigAwakeFromNib = swizzleMethod(dbcClass, "awakeFromNib",
+                                           (IMP)swizzled_awakeFromNib);
+        gOrigStartIndicator = swizzleMethod(dbcClass, "startIndicator",
+                                             (IMP)swizzled_startIndicator);
+        gOrigTextTransferring = swizzleMethod(dbcClass, "textTransferring:",
+                                               (IMP)swizzled_textTransferring);
+        gOrigTextElapsed = swizzleMethod(dbcClass, "textElapsed:",
+                                          (IMP)swizzled_textElapsed);
+        gOrigTextPutPaper = swizzleMethod(dbcClass, "textPutPaper:",
+                                           (IMP)swizzled_textPutPaper);
+        gOrigTextTimeRemain = swizzleMethod(dbcClass, "textTimeRemain:",
+                                             (IMP)swizzled_textTimeRemain);
+        gOrigCloseTransportWindow = swizzleMethod(dbcClass, "closeTransportWindow",
+                                                    (IMP)swizzled_closeTransportWindow);
+        gOrigShowContinueButton = swizzleMethod(dbcClass, "showContinueButton:",
+                                                  (IMP)swizzled_showContinueButton);
+    }
+
+    // --- DS720DDS: redirect alerts to terminal ---
+    Class dsClass = NSClassFromString(@"DS720DDS");
+    if (dsClass) {
+        swizzleMethod(dsClass, "showAlert:", (IMP)swizzled_showAlert);
+    }
+
+    // Ctrl+C: cancel paper-wait countdown and save scanned pages
+    struct sigaction sa_int;
+    memset(&sa_int, 0, sizeof(sa_int));
+    sa_int.sa_handler = sigintHandler;
+    sigemptyset(&sa_int.sa_mask);
+    sa_int.sa_flags = 0;
+    sigaction(SIGINT, &sa_int, NULL);
+
+    // Backup crash handlers (defense-in-depth for unswizzled crash paths)
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = driverCrashSignalHandler;
@@ -566,9 +759,17 @@ static BOOL twainEnableDS(void) {
 
     if (rc != 0 && rc != 2) { // TWRC_SUCCESS or TWRC_CHECKSTATUS
         TW_UINT16 cc = twainGetStatus(&gDSIdentity);
-        fprintf(stderr, "Error: Failed to enable data source (rc=%d, cc=%d)\n", rc, cc);
-        if (cc == 11) fprintf(stderr, "  Sequence error - DS may be in wrong state\n");
-        if (cc == 5)  fprintf(stderr, "  Operation error\n");
+        // Newline to separate from any driver UI text on the current line
+        fprintf(stderr, "\n");
+        if (cc == 11) {
+            fprintf(stderr, "Error: No paper detected in the feeder.\n");
+            fprintf(stderr, "  Insert a document and try again.\n");
+        } else if (cc == 5) {
+            fprintf(stderr, "Error: Scanner operation error (rc=%d, cc=%d)\n", rc, cc);
+            fprintf(stderr, "  Try unplugging and reconnecting the scanner.\n");
+        } else {
+            fprintf(stderr, "Error: Failed to enable data source (rc=%d, cc=%d)\n", rc, cc);
+        }
         return NO;
     }
 
@@ -864,8 +1065,8 @@ static void twainCleanup(void) {
     if (!twainFindDS()) goto done;
     fprintf(stderr, "Opening scanner...\n");
     if (!twainOpenDS()) goto done;
-    // Install crash workarounds now that the driver is loaded
-    installDriverCrashWorkarounds();
+    // Install UI swizzles now that the driver is loaded
+    installDriverUISwizzles();
     fprintf(stderr, "Setting capabilities...\n");
     twainSetCapabilities();
     fprintf(stderr, "Starting scan...\n");
@@ -1297,6 +1498,7 @@ static void showHelp(void) {
     printf("  --simplex                Simplex scanning\n");
     printf("  --format FMT             Output format: pdf, tiff, jpeg, png (default: pdf)\n");
     printf("  --output PATH            Output file path\n");
+    printf("  --debug                  Show driver debug logging\n");
     printf("\n");
     printf("Interactive mode keys:\n");
     printf("  s     Toggle simplex/duplex\n");
@@ -1306,6 +1508,24 @@ static void showHelp(void) {
     printf("  o     Change output directory\n");
     printf("  ENTER Start scanning\n");
     printf("  q     Quit\n");
+}
+
+// Redirect fd 2 to /dev/null so the driver's NSLog output is suppressed,
+// but reassign our stderr FILE* to the real terminal so fprintf(stderr,...)
+// still works. Called unless --debug is passed.
+static void suppressDriverLogging(void) {
+    int saved = dup(STDERR_FILENO);
+    if (saved < 0) return;
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull < 0) { close(saved); return; }
+    dup2(devnull, STDERR_FILENO);
+    close(devnull);
+    gRealStderrFd = saved;
+    FILE *realStderr = fdopen(saved, "w");
+    if (realStderr) {
+        stderr = realStderr;
+        setbuf(stderr, NULL); // unbuffered like original stderr
+    }
 }
 
 // ============================================================================
@@ -1359,11 +1579,18 @@ int main(int argc, const char *argv[]) {
                 outputPath = [[NSString stringWithUTF8String:argv[i]]
                     stringByExpandingTildeInPath];
             }
+            else if (strcmp(argv[i], "--debug") == 0) {
+                gDebug = YES;
+            }
             else {
                 fprintf(stderr, "Unknown option: %s\n", argv[i]);
                 fprintf(stderr, "Use --help for usage info\n");
                 return 1;
             }
+        }
+
+        if (!gDebug) {
+            suppressDriverLogging();
         }
 
         if (doScan) {
